@@ -34,3 +34,21 @@
                  as cow = (find-fulfiled herd)
                  do (setf herd (delete cow herd))
                  sum (fulfil cow)))))))
+
+(test breaking-running-vow
+    (is (eq :broke (handler-case
+                       (let ((vow (vow #'(lambda () (sleep 3) :did-it))))
+                         (break-vow vow)
+                         (fulfil vow))
+                     (broken-vow () :broke)))))
+
+(test breaking-kept-vow
+  (is (equal '(13 :broke)
+             (let ((vow (vow #'(lambda () 13))))
+               (list
+                (fulfil vow)
+                (progn
+                  (break-vow vow)
+                  (handler-case
+                      (fulfil vow)
+                    (broken-vow () :broke))))))))

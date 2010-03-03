@@ -13,9 +13,14 @@ is only unique with a given vow some effort is made to keep them from overlappin
 (defgeneric delete-trigger (t t)
   (:documentation "Given a vow and either the trigger id or the lambda delete it from the vow. The caller must be holding the vow's lock."))
 
-(defgeneric keep-vow (t))
+(defgeneric keep-vow (t)
+  (:documentation "The internal method on a vow that actually keeps the promise and fires the triggers."))
 
-(defgeneric enqueue (t t))
+(defgeneric enqueue (t t)
+  (:documentation "The internal method on of a promise keeper which adds a vow to it's to do list."))
+
+(defgeneric break-vow (t)
+  (:documentation "The external method used force a vow to be fufilled such that retrieve it signals the broken-vow error."))
 
 (defgeneric fulfil (t))
 
@@ -39,6 +44,7 @@ is only unique with a given vow some effort is made to keep them from overlappin
     (or (eq :kept run-state)
         (eq :failed run-state))))
 
+
 (defmethod create-trigger (vow lambda)
   (with-slots (triggers max-trigger) vow
     (incf max-trigger)
@@ -52,7 +58,12 @@ is only unique with a given vow some effort is made to keep them from overlappin
   (with-slots (triggers) vow
     (setf triggers (delete trigger triggers :key #'cdr))))
 
-
+(defun fire-triggers (vow)
+  "Invoked once a vow has been fufilled it runs the vow's triggers."
+  (with-slots (triggers) vow
+    (loop
+       for trigger? = (pop triggers)
+       while trigger? do (funcall (cdr trigger?) vow))))
 
 (defmethod print-object ((v vow) stream)
   (with-slots (run-state) v
@@ -62,17 +73,45 @@ is only unique with a given vow some effort is made to keep them from overlappin
 (defclass promise-keeper ()
   ((lock :initform (bt:make-lock))
    (fresh-promises :initform (bt:make-condition-variable))
-   (promises :accessor promises :initform nil :type list)
+   (to-do-list :accessor to-do-list :initform nil :type list)
    (threads :initform nil :type list)
+   (vow-escapes :initform (make-hash-table :test #'eq)
+                :documentation "For every vow we are working maps to a clozure that will stop that and break the vow.")
    (max-threads :initform 4 :type fixnum)))
 
 (defmethod print-object ((k promise-keeper) stream)
-  (with-slots (threads promises) k
+  (with-slots (threads to-do-list) k
     (print-unreadable-object (k stream :type t :identity t)
-      (format stream "~D threads ~D promises" (length threads) (length promises)))))
+      (format stream "~D threads ~D to-do-list" (length threads) (length to-do-list)))))
+
+(define-condition broken-vow (simple-error) ())
+
+(defun mark-vow-as-broken (vow)
+  (with-slots (run-state error?) vow
+    (setf run-state :failed)
+    (setf error? (make-condition 'broken-vow
+                         :format-control "Broke the vow ~S"
+                         :format-arguments (list vow)))))
+
+(defmethod break-vow ((vow vow))
+  (with-slots ((pk-lock lock) to-do-list vow-escapes) *promise-keeper*
+    (with-slots ((vow-lock lock) run-state) vow
+      (bt:with-lock-held (pk-lock)
+        (bt:with-lock-held (vow-lock)
+          (ecase run-state
+            (:enqueued
+             (setf to-do-list (delete vow to-do-list))
+             (mark-vow-as-broken vow))
+            (:keeping
+             (funcall (gethash vow vow-escapes)))
+            ((:new :kept :failed)
+             (mark-vow-as-broken vow)))))))
+  (fire-triggers vow))
+
+
 
 (defmethod keep-vow ((vow vow))
-  (with-slots (lock lambda results error? run-state triggers) vow
+  (with-slots (lock lambda results error? run-state) vow
     (bt:with-lock-held (lock)
       (setf run-state :keeping)
       (handler-case
@@ -84,31 +123,46 @@ is only unique with a given vow some effort is made to keep them from overlappin
         (condition (c)
           (setf results :error)
           (setf error? c)
-          (setf run-state :failed))))
-    (loop
-       for trigger? = (pop triggers)
-       while trigger? do (funcall (cdr trigger?) vow))))
+          (setf run-state :failed)))))
+  (fire-triggers vow))
 
 (defmethod enqueue ((vow vow) (keeper promise-keeper))
-  "Add a single vow to the promises of a promise keeper."
-  (with-slots (fresh-promises promises (keeper-lock lock)) keeper
+  "Add a single vow to the to-do-list of a promise keeper."
+  (with-slots (fresh-promises to-do-list (keeper-lock lock)) keeper
     (with-slots (run-state (vow-lock lock)) vow
       (bt:with-lock-held (keeper-lock)
         (bt:with-lock-held (vow-lock)
-          (push vow promises)
+          (push vow to-do-list)
           (setf run-state :enqueued))))
     (bt:condition-notify fresh-promises))
   vow)
 
 (defun worker-of-promise-keeper (keeper)
-  (with-slots (lock promises fresh-promises) keeper
+  (with-slots ((keeper-lock lock) to-do-list fresh-promises vow-escapes) keeper
+    ;; run forever.
     (loop
-       (loop
-          for vow? = (bt:with-lock-held (lock) (pop promises))
-          while vow? 
-          do (keep-vow vow?))
-       (bt:with-lock-held (lock)
-         (bt:condition-wait fresh-promises lock)))))
+       ;; Drain the to do list, keep our promises.  The awesome
+       ;; complexity is so we can break them in the midst of keeping
+       ;; them.
+       (loop 
+          named working-on-the-to-list
+          with vow
+          do (block :abandon-ship
+               (flet ((abandon-vow ()
+                        (mark-vow-as-broken vow)
+                        (return-from :abandon-ship :broke-vow-while-running)))
+                 (unwind-protect
+                      (progn
+                        (bt:with-lock-held (keeper-lock) 
+                          (setf vow (pop to-do-list))
+                          (unless vow (return-from working-on-the-to-list nil))
+                          (setf (gethash vow vow-escapes) #'abandon-vow))
+                        (keep-vow vow))
+                   (bt:with-lock-held (keeper-lock)
+                     (remhash vow vow-escapes))))))
+       ;; Todo list is empty, so wait for fresh promises to keep.
+       (bt:with-lock-held (keeper-lock)
+         (bt:condition-wait fresh-promises keeper-lock)))))
 
 
 (defmethod initialize-instance :after ((keeper promise-keeper) &rest initargs &key &allow-other-keys)
@@ -156,8 +210,6 @@ is only unique with a given vow some effort is made to keep them from overlappin
           (bt:condition-wait my-notify my-lock))
         (bt:with-lock-held (lock)
           (extract-result))))))
-
-
 
 (defun find-fulfiled (vows)
   "Return the first of vows that has been fulfilled."

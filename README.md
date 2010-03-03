@@ -29,7 +29,13 @@ which may have multiple values or be an error.
 <b>vow:find-fulfilled vows</b> returns a vow from the list vows that has been fufilled, blocking
 if necessary.
 
-In theory you can create new versions of vow and promise-keeper.
+<b>vow:broken-vow</b> the subclass of simple-error used to denote the condition of created with by vow:break-vow.
+
+<b>vow:break-vow vow</b> Fulfils the vow as if it had suffered the simple error vow:broken-vow.  Blocks
+until it can gain a lock on the promise keeper.  It then either removes the vow from his to do list,
+or if one of his minions is currently working on keeping this promise it forces that attempt to
+unwind.  It marks the vow as having been fufill by the error vow:broken-vow, even if the vow
+is already fufilled.
 
 ## Missing stuff and notes
 
@@ -49,12 +55,6 @@ an additional trigger on that vow.
 
 <b>vow:remove-trigger vow trigger</b> a method on a vow.  returns nil.  after
 calling this the trigger will no longer be pending for that vow.
-
-### Missing: breaking vows
-
-<b>vow:break vow</b> which removes the vow from the promise-keeper's
-to do list, or unwinds the running attempt to fulfill the vow, is
-missing.
 
 ### Missing abstractions on sets of vows.
 
@@ -76,3 +76,8 @@ list and that seems extremely unlikely to be the right approach.
 
 In fact I'm confident that it would be possible to have all threads
 in the pool blocked on I/O while there are other items in the 
+
+### Affordances
+
+In theory it should be possible to implement subclasses of promise-keeper
+and promise.
