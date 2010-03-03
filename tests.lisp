@@ -1,21 +1,36 @@
-;; -*- mode: lisp -*-
+;; -*- mode: common-lisp -*-
 
 (in-package "VOWS")
 
-;; ekk!
+(def-suite vows :description "Testing for vows.")
 
+(in-suite vows)
 
+(test zero-test
+  "The simplest test"
+  (is (eq t t)))
 
-(defun try-it ()
-  (loop
-     with z = (loop for i below 10
-                 collect (vow #'(lambda () (let ((n (random 10))) (sleep n) (values :hi n)))))
-     while z
-     as v = (find-fulfiled z)
-     do
-       (setf z (delete v z))
-       (print (multiple-value-list (fulfil v)))
-       (print z)
-       (print *promise-keeper*)
-       (force-output *standard-output*)))
+(test one-promise
+  "One promise"
+  (is (eq 1 (fulfil (vow #'(lambda () 1))))))
 
+(test two-promises
+  (is (eq 4 (+ (fulfil (vow #'(lambda () 1))) (fulfil (vow #'(lambda () 3)))))))
+
+(test two-promises-with-sleep
+  (is (eq 4 (+ (fulfil (vow #'(lambda () (sleep 2)  1))) (fulfil (vow #'(lambda () (sleep 1) 3)))))))
+
+(test herd-of-promises
+  (let ((n 20))
+    (labels ((cow (n)
+               #'(lambda ()
+                   ; (sleep (random 3))
+                   n))
+             (make-herd ()
+               (loop for i below n collect (vow (cow i)))))
+      (is (eq (loop for i below n sum i)
+              (loop with herd = (make-herd)
+                 while herd
+                 as cow = (find-fulfiled herd)
+                 do (setf herd (delete cow herd))
+                 sum (fulfil cow)))))))
